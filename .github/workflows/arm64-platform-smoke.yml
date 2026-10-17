@@ -1,0 +1,30 @@
+name: ARM64 platform smoke - synthetic only
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type RUN_SYNTHETIC_ARM64_SMOKE to run the disposable smoke test'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: arm64-platform-smoke
+  cancel-in-progress: false
+jobs:
+  arm64-platform-smoke:
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+           github.ref == 'refs/heads/main' &&
+           github.actor == 'hybmo99' &&
+           inputs.confirm == 'RUN_SYNTHETIC_ARM64_SMOKE' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 8
+    steps:
+      - name: Obtain public test source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Inspect disposable Linux platform (no company source)
+        shell: bash
+        run: timeout --signal=TERM --kill-after=5s 180s bash scripts/platform_smoke.sh

@@ -1,0 +1,3 @@
+Offline-only check: bash -n scripts/platform_smoke.sh
+Inspect .github/workflows/arm64-platform-smoke.yml. It must contain only workflow_dispatch, no pull_request/push/schedule; runs-on ubuntu-24.04-arm; contents: read; no secrets or company source.
+No hosted execution was performed when preparing this ZIP.
