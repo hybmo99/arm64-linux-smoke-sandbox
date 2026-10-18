@@ -6,10 +6,13 @@
 #   listener  - a transient systemd service (own slice) bound to 127.0.0.1:PORT inside the namespace
 #   target    - a transient systemd service (own slice) whose agent connects to the listener when asked
 #   control   - a second transient systemd service (a DIFFERENT slice) whose agent does the same
+# All namespace work uses `nsenter --net=` (in_ns), NOT `ip netns exec`: the latter swaps in a fresh /sys, which hides /sys/fs/cgroup, and nft then cannot resolve a cgroup
+# path ("cgroupv2 path fails: No such file or directory" - observed in the v2 hosted run 39157494544).  nsenter joins only the network namespace.
 # Phases: (1) both connect  (2) install ONE nft table INSIDE the namespace: reject the target's cgroup, count the control's  (3) target refused,
 # control still connects, counters prove which rule matched  (4) delete the table: target connects again.  Then cleanup and a residue check.
 # Exit codes: 0 PASS; 30 INCOMPLETE (platform lacks something, or the host baseline cannot be read completely; not a pass); 40-59 FAIL (59 = the host
-# state differs from its baseline, also after a FAILED run); 143 terminated.  Never falls back to the host firewall.
+# state differs from its baseline, also after a FAILED run); 143 terminated.  `cleanup-verify` (the always-run workflow step) compares the persisted baseline one
+# last time and is the only place that removes it:  CLEAN 0, RESIDUE / HOST_CHANGED / HOST_UNVERIFIED 1.  Never falls back to the host firewall.
 #   sudo --preserve-env=GITHUB_RUN_ID,ImageVersion,ImageOS bash scripts/egress_enforcement.sh            # the probe (root)
 #   sudo --preserve-env=GITHUB_RUN_ID bash scripts/egress_enforcement.sh cleanup-verify                  # idempotent cleanup + residue check
 set -Eeuo pipefail
@@ -19,7 +22,7 @@ PORT=18080
 LIFETIME=150          # seconds the listener and the agents may live (systemd RuntimeMaxSec=160 is the backstop)
 VERDICT=INCOMPLETE
 CLEANED=0
-NS="" WORK="" RPC="" TABLE="" RUN_ID="" BASELINE_FILE="" HOST_COMPARED=0
+NS="" WORK="" RPC="" TABLE="" RUN_ID="" BASELINE_FILE="" STARTED_FILE="" HOST_COMPARED=0
 U_TARGET="" U_CONTROL="" U_LISTEN="" S_TARGET="" S_CONTROL="" S_LISTEN=""
 NS_ID="" HOST_NS_ID="" HOST_BEFORE="" N_LEVEL="" MATCH_T="" MATCH_C=""
 V_PID="" V_CG="" A_JSON="" DENY_PKTS="" CTRL_PKTS=""
@@ -43,6 +46,13 @@ proc_cgroup() { awk -F: '$1==0 && $2=="" {print $3; found=1; exit} END {if (!fou
 proc_comm()   { cat "/proc/$1/comm"; }
 proc_netns()  { readlink "/proc/$1/ns/net"; }
 netns_file_id() { printf 'net:[%s]\n' "$(stat -L -c %i "/run/netns/$1")"; }
+# in_ns CMD... : run CMD with ONLY the network namespace of the disposable namespace joined (mounts, /sys and cgroup visibility stay the host's).  The single place
+# any firewall or interface command enters the namespace.
+in_ns() { timeout 10 nsenter --net="/run/netns/$NS" -- "$@"; }
+ns_current_id()         { in_ns readlink /proc/self/ns/net; }
+cgroup_fstype_ns()      { in_ns stat -f -c %T /sys/fs/cgroup; }
+cgroup_fstype_host()    { stat -f -c %T /sys/fs/cgroup; }
+cgroup_dir_visible_ns() { in_ns test -d "/sys/fs/cgroup/$1"; }
 
 # ---- names: derived ONLY from the numeric run id, so a collision or a stray cleanup cannot touch anything else ------------------------------------
 init_names() {
@@ -51,7 +61,8 @@ init_names() {
   NS="t0b${run_id}"; TABLE="t0b${run_id}"
   S_TARGET="t0btarget${run_id}.slice"; S_CONTROL="t0bcontrol${run_id}.slice"; S_LISTEN="t0blisten${run_id}.slice"
   U_TARGET="t0b-target-${run_id}.service"; U_CONTROL="t0b-control-${run_id}.service"; U_LISTEN="t0b-listen-${run_id}.service"
-  BASELINE_FILE="/run/t0b-baseline-${run_id}"      # deliberately NOT matched by the work-directory glob: it must outlive a cleanup and a killed probe
+  BASELINE_FILE="/run/t0b-baseline-${run_id}"      # deliberately NOT matched by the work-directory glob: it must outlive a cleanup, a killed probe and the probe's own exit
+  STARTED_FILE="/run/t0b-started-${run_id}"        # written right after the baseline; its presence means "a baseline WAS taken", so a vanished baseline is detectable
   RUN_ID="$run_id"
 }
 
@@ -77,7 +88,7 @@ host_snapshot() {
 compare_host_state() {   # read-only; 0 = identical to the baseline (or none was ever recorded); 1 = changed or not verifiable
   local baseline after
   HOST_COMPARED=1
-  if [[ -z "$BASELINE_FILE" || ! -f "$BASELINE_FILE" ]]; then log "HOST-STATE: no baseline recorded (the probe stopped before taking one)"; return 0; fi
+  if [[ -z "$BASELINE_FILE" || ! -f "$BASELINE_FILE" ]]; then log "HOST-STATE: no baseline file present (none was taken in this process or it was already consumed); nothing to compare here"; return 0; fi
   baseline=$(cat "$BASELINE_FILE")
   after=$(host_snapshot) || { log "HOST-STATE: the current host state could not be read completely, so it cannot be shown to be unchanged"; return 1; }
   if [[ "$after" != "$baseline" ]]; then
@@ -98,9 +109,13 @@ cleanup() {
     systemctl stop "$unit" >/dev/null 2>&1
     systemctl reset-failed "$unit" >/dev/null 2>&1
   done
+  for unit in "$S_TARGET" "$S_CONTROL" "$S_LISTEN"; do   # an emptied transient slice stays loaded (and its cgroup directory stays) until it is stopped: run 39157494544 left all three
+    [[ -n "$unit" ]] || continue
+    systemctl stop "$unit" >/dev/null 2>&1
+    systemctl reset-failed "$unit" >/dev/null 2>&1
+  done
   if [[ -n "$NS" ]] && ip netns list 2>/dev/null | grep -q "^${NS}\([[:space:]]\|$\)"; then
-    ip netns exec "$NS" nft delete table inet "$TABLE" >/dev/null 2>&1
-    ip netns delete "$NS" >/dev/null 2>&1
+    ip netns delete "$NS" >/dev/null 2>&1           # deleting the namespace destroys its firewall state: no separate (and possibly mis-aimed) table delete is needed
   fi
   if [[ "$RUN_ID" =~ ^[0-9]{1,18}$ ]]; then   # the glob can only match this run's own directories (the run id is numeric and validated)
     local dir
@@ -113,6 +128,8 @@ verify_clean() {   # nothing of this run may remain: units, slices, cgroup direc
   local bad=0 out slice i
   out=$(systemctl list-units --all --plain --no-legend "t0b-*-${RUN_ID}.service" 2>/dev/null | awk '{print $1}')
   [[ -z "$out" ]] || { log "RESIDUE: units: $out"; bad=1; }
+  out=$(systemctl list-units --all --plain --no-legend --type=slice "t0b*${RUN_ID}.slice" 2>/dev/null | awk '{print $1}')
+  [[ -z "$out" ]] || { log "RESIDUE: slice units: $out"; bad=1; }
   for i in 1 2 3 4 5 6 7 8 9 10; do
     out=""
     for slice in "$S_TARGET" "$S_CONTROL" "$S_LISTEN"; do
@@ -301,7 +318,7 @@ expect_refused() {   # expect_refused NAME SEQ PID CG LABEL
 }
 accepts() { if [[ -f "$WORK/listener.log" ]]; then wc -l <"$WORK/listener.log" | tr -d '[:space:]'; else printf 0; fi; }
 read_counters() {   # sets DENY_PKTS and CTRL_PKTS from the rules INSIDE the namespace
-  timeout 10 ip netns exec "$NS" nft -j list chain inet "$TABLE" out >"$WORK/chain.json" 2>"$WORK/chain.err" || fail 47 "cannot read the rule counters back: $(head -c 200 "$WORK/chain.err")"
+  in_ns nft -j list chain inet "$TABLE" out >"$WORK/chain.json" 2>"$WORK/chain.err" || fail 47 "cannot read the rule counters back: $(head -c 200 "$WORK/chain.err")"
   local out; out=$(tool counters "$WORK/chain.json") || fail 47 "the counters of both rules were not found in the read-back"
   DENY_PKTS=${out#deny=}; DENY_PKTS=${DENY_PKTS%% *}; CTRL_PKTS=${out##*control=}
 }
@@ -314,7 +331,7 @@ platform_checks() {
   [[ "$id" == ubuntu && "$version" == 24.04 ]] || incomplete 30 "not Ubuntu 24.04 ($id $version)"
   [[ "$pid1" == systemd ]] || incomplete 30 "systemd is not PID 1 ($pid1)"
   local tool_name
-  for tool_name in systemd-run systemctl ip nft python3 timeout awk sed; do command -v "$tool_name" >/dev/null || incomplete 30 "missing command: $tool_name"; done
+  for tool_name in systemd-run systemctl ip nft nsenter python3 timeout awk sed; do command -v "$tool_name" >/dev/null || incomplete 30 "missing command: $tool_name"; done
   sd=$(systemctl --version | head -n 1 | awk '{print $2}')
   [[ "$sd" =~ ^[0-9]+$ ]] && (( sd >= 242 )) || incomplete 30 "systemd $sd lacks NetworkNamespacePath"
   [[ "$(id -u)" == 0 ]] || incomplete 30 "must run as root (the workflow uses sudo)"
@@ -325,13 +342,13 @@ run_probe() {
   platform_checks
   WORK=$(mktemp -d "/run/t0b-${RUN_ID}.XXXXXX"); RPC="$WORK/rpc"; mkdir -p "$RPC"
   HOST_BEFORE=$(host_snapshot) || incomplete 30 "the host baseline could not be read completely; refusing to compare against partial data"
-  printf '%s\n' "$HOST_BEFORE" >"$BASELINE_FILE.tmp" && mv -f "$BASELINE_FILE.tmp" "$BASELINE_FILE"      # kept outside the work directory so a failed or killed run can still be compared
+  printf '%s\n' "$HOST_BEFORE" >"$BASELINE_FILE.tmp" && mv -f "$BASELINE_FILE.tmp" "$BASELINE_FILE" && : >"$STARTED_FILE"      # kept outside the work directory so a failed or killed run can still be compared
   log "host baseline taken (ruleset, links, addresses, routes, namespaces): sha256 $(printf '%s' "$HOST_BEFORE" | sha256sum | cut -c1-16)"
   write_helpers
 
   # namespace: loopback only
   ip netns add "$NS" || incomplete 30 "could not create network namespace $NS"
-  timeout 10 ip netns exec "$NS" ip link set lo up || incomplete 30 "could not bring up lo in $NS"
+  in_ns ip link set lo up || incomplete 30 "could not bring up lo in $NS"
   NS_ID=$(netns_file_id "$NS"); HOST_NS_ID=$(proc_netns 1)
   [[ -n "$NS_ID" && "$NS_ID" != "$HOST_NS_ID" ]] || incomplete 30 "the namespace is not distinct from the host namespace"
   log "namespace $NS ($NS_ID) created; host namespace $HOST_NS_ID is not used by any service below"
@@ -358,6 +375,17 @@ run_probe() {
   [[ "$N_LEVEL" =~ ^[0-9]+$ && "$MATCH_T" =~ ^[A-Za-z0-9._/-]+$ && "$MATCH_C" =~ ^[A-Za-z0-9._/-]+$ && "$MATCH_T" != "$MATCH_C" ]] || fail 49 "derived matcher is not usable"
   log "matcher: socket cgroupv2 level $N_LEVEL \"$MATCH_T\" (target) differs from \"$MATCH_C\" (control) at that level"
 
+  # before ANY firewall mutation: the entry point really lands in the disposable namespace, and nft can see the cgroup directories it has to match.  Read-only diagnostics.
+  local nsnow fs_ns fs_host
+  nsnow=$(ns_current_id) || incomplete 30 "cannot enter the namespace to check where firewall commands would land"
+  [[ "$nsnow" == "$NS_ID" && "$nsnow" != "$HOST_NS_ID" ]] || incomplete 30 "the namespace entry point lands in $nsnow, not in $NS_ID; refusing to touch any firewall"
+  fs_ns=$(cgroup_fstype_ns 2>&1) || fs_ns="unreadable"; fs_host=$(cgroup_fstype_host 2>&1) || fs_host="unreadable"
+  log "diagnostic (read-only): /sys/fs/cgroup is $fs_ns in the namespace-entry context and $fs_host on the host"
+  for _slice_path in "$MATCH_T" "$MATCH_C"; do
+    cgroup_dir_visible_ns "$_slice_path" || incomplete 30 "/sys/fs/cgroup/$_slice_path is not visible to nft in the namespace context (fs type there: $fs_ns; on the host: $fs_host)"
+  done
+  log "diagnostic (read-only): both matcher cgroup directories are visible from the namespace-entry context"
+
   # PHASE 1 - baseline: both connect, no rule exists
   log "PHASE 1 - before any rule: both services connect"
   local base; base=$(accepts)
@@ -379,9 +407,9 @@ table inet $TABLE {
 }
 NFT
 )
-  printf '%s\n' "$rules" | timeout 10 ip netns exec "$NS" nft --check -f - >/dev/null 2>"$WORK/check.err" || incomplete 30 "nft rejected the cgroupv2 ruleset here: $(head -c 200 "$WORK/check.err")"
-  printf '%s\n' "$rules" | timeout 10 ip netns exec "$NS" nft -f - 2>"$WORK/load.err" || fail 51 "could not load the rule inside the namespace: $(head -c 200 "$WORK/load.err")"
-  log "rule readback (inside $NS):"; timeout 10 ip netns exec "$NS" nft list table inet "$TABLE" | sed 's/^/    /'
+  printf '%s\n' "$rules" | in_ns nft --check -f - >/dev/null 2>"$WORK/check.err" || incomplete 30 "nft rejected the cgroupv2 ruleset here: $(head -c 200 "$WORK/check.err")"
+  printf '%s\n' "$rules" | in_ns nft -f - 2>"$WORK/load.err" || fail 51 "could not load the rule inside the namespace: $(head -c 200 "$WORK/load.err")"
+  log "rule readback (inside $NS):"; in_ns nft list table inet "$TABLE" | sed 's/^/    /'
   read_counters; local deny0=$DENY_PKTS ctrl0=$CTRL_PKTS
   [[ "$deny0" == 0 && "$ctrl0" == 0 ]] || fail 51 "counters are not zero right after installation (deny=$deny0 control=$ctrl0)"
   log "PASS: phase 2 (rule installed and read back; counters deny=$deny0 control=$ctrl0)"
@@ -415,8 +443,8 @@ NFT
 
   # PHASE 4 - remove only this table; the target recovers
   log "PHASE 4 - remove the rule: the target recovers"
-  timeout 10 ip netns exec "$NS" nft delete table inet "$TABLE" || fail 56 "could not delete the table inside the namespace"
-  if timeout 10 ip netns exec "$NS" nft list table inet "$TABLE" >/dev/null 2>&1; then fail 56 "the table is still present after deletion"; fi
+  in_ns nft delete table inet "$TABLE" || fail 56 "could not delete the table inside the namespace"
+  if in_ns nft list table inet "$TABLE" >/dev/null 2>&1; then fail 56 "the table is still present after deletion"; fi
   base=$(accepts)
   expect_connect target 4 "$PID_TARGET" "$CG_TARGET" "phase 4"
   expect_connect control 4 "$PID_CONTROL" "$CG_CONTROL" "phase 4"
@@ -427,8 +455,7 @@ NFT
   cleanup
   verify_clean || fail 58 "residue after cleanup"
   compare_host_state || fail 59 "the host firewall/network state changed or could not be verified"
-  rm -f -- "$BASELINE_FILE"
-  log "PASS: cleanup complete (no units, slices, cgroups, namespace or files left) and the host state is unchanged"
+  log "PASS: cleanup complete (no units, slices, cgroups, namespace or work files left) and the host state is unchanged; the baseline is kept for the final standalone comparison"
   VERDICT=PASS
 }
 
@@ -439,7 +466,6 @@ on_exit() {
   if [[ "$HOST_COMPARED" != 1 ]]; then      # a failed, early-stopped or terminated run is compared against the baseline too
     if ! compare_host_state; then VERDICT=FAIL; rc=59; fi
   fi
-  [[ -n "$BASELINE_FILE" ]] && rm -f -- "$BASELINE_FILE" "$BASELINE_FILE.tmp"
   log "VERDICT: $VERDICT"
   exit "$rc"
 }
@@ -447,14 +473,18 @@ on_exit() {
 main() {
   harden_env
   init_names
-  if [[ "${1:-}" == cleanup-verify ]]; then   # the always-run workflow step: covers a probe that was killed before its own trap could run
-    local residue=0 changed=0
+  if [[ "${1:-}" == cleanup-verify ]]; then   # the always-run workflow step: covers a probe that was killed, and gives an independent final comparison
+    local residue=0 changed=0 unverified=0
     cleanup
     verify_clean || residue=1
-    compare_host_state || changed=1
-    rm -f -- "$BASELINE_FILE" "$BASELINE_FILE.tmp"
-    [[ "$residue" == 0 && "$changed" == 0 ]] && { log "VERDICT: CLEAN"; return 0; }
-    [[ "$residue" == 1 ]] && log "VERDICT: RESIDUE" || log "VERDICT: HOST_CHANGED"
+    if [[ -f "$STARTED_FILE" && ! -f "$BASELINE_FILE" ]]; then
+      log "HOST-STATE: a baseline was taken (marker present) but it is gone; the host state cannot be verified"; unverified=1
+    else
+      compare_host_state || changed=1
+    fi
+    rm -f -- "$BASELINE_FILE" "$BASELINE_FILE.tmp" "$STARTED_FILE"       # the one and only place the baseline is consumed
+    if [[ "$residue" == 0 && "$changed" == 0 && "$unverified" == 0 ]]; then log "VERDICT: CLEAN"; return 0; fi
+    if [[ "$residue" == 1 ]]; then log "VERDICT: RESIDUE"; elif [[ "$changed" == 1 ]]; then log "VERDICT: HOST_CHANGED"; else log "VERDICT: HOST_UNVERIFIED"; fi
     return 1
   fi
   trap on_exit EXIT
